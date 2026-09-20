@@ -1,0 +1,25 @@
+# pdf-toolkit 的依赖
+#
+# 分两类：
+#   1) pymupdf —— 核心。所有子命令都要它（读写 PDF、渲染页面、识别表格、填表单）
+#   2) 其余四个 —— OCR 才需要。没有它们，除了 `ocr` / `to-ai --ocr` 之外的功能照常可用。
+#
+# 装 OCR 这一组就够了，**不需要**系统级依赖（不需要 Tesseract、不需要 Ghostscript）：
+# RapidOCR 走 ONNX 推理，中文模型（PP-OCRv6）随 wheel 一起下载，完全离线可用。
+# 这条路线是刻意选的——很多机器没有管理员权限装 Tesseract，而 pip 通常能用。
+#
+# 安装（建议装进本 skill 自带的 .venv，不要污染全局环境）：
+#   python -m venv .venv
+#   .venv/Scripts/python.exe -m pip install -r requirements.txt   # Windows
+#   .venv/bin/python -m pip install -r requirements.txt           # macOS / Linux
+#
+# 可选升级（装了会被自动优先使用，命令见 scripts/pdftool.py check）：
+#   tesseract  —— 系统装 Tesseract-OCR + chi_sim 语言包，再 pip install pytesseract
+#   ocrmypdf   —— pip install ocrmypdf（另需 Ghostscript），整册流水线质量更好
+
+pymupdf>=1.24
+
+# OCR（扫描版必装；纯文字 PDF 可以不要）
+rapidocr>=3.0
+onnxruntime>=1.17
+pillow>=10.0

@@ -1,0 +1,41 @@
+# 自带虚拟环境（体积大、平台相关，任何人用前自己建）
+.venv/
+venv/
+env/
+
+# Python
+# 两种写法都要留：带斜杠的只匹配"当前已存在的目录"，
+# 目录被删掉后就不生效了，加一条不带斜杠的兜底。
+__pycache__/
+__pycache__
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 演示与试跑产物
+.demo/
+demo_text.pdf
+demo_scan.pdf
+
+# 运行产物：OCR 出来的可搜索 PDF、AI 友好包、页锚全文、拆出来的分册
+*_ocr.pdf
+*_ai/
+*.pages.txt
+_split_manifest.json
+pdf_pages/
+parts/
+
+# 表格与图片导出目录（这些是逐本书的中间产物，不是源码）
+tables/
+images/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 本地临时
+*.tmp
+*.log
