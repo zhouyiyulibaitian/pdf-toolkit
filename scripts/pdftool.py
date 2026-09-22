@@ -315,8 +315,8 @@ def analyze_page(page, *, tables: bool = False, min_rows: int = 2, min_cols: int
         level, why = (verdict if verdict else (None, ""))
         items.append({"kind": "heading" if verdict else "para", "level": level or 0,
                       "strict": why == "pattern", "synthetic": synthetic,
-                      "y0": bbox[1], "x0": bbox[0], "x1": bbox[2], "text": text,
-                      "lines": n_lines, "size": size})
+                      "y0": bbox[1], "y1": bbox[3], "x0": bbox[0], "x1": bbox[2],
+                      "text": text, "lines": n_lines, "size": size})
     for t in table_list:
         items.append({"kind": "table", "y0": t["bbox"][1], "x0": t["bbox"][0],
                       "x1": t["bbox"][2], "table": t, "synthetic": synthetic})
@@ -358,39 +358,61 @@ def _attach_captions(items: list[dict], page) -> list[dict]:
     return [it for it in items if id(it) not in used]
 
 
-def reflow_paragraphs(items: list[dict], page) -> list[dict]:
-    """把"一行一个块"的碎片拼回段落。
+def _pct(values_sorted: list[float], ratio: float) -> float:
+    """取已排序列表的分位值（空列表返回 0）。"""
+    if not values_sorted:
+        return 0.0
+    idx = max(0, min(len(values_sorted) - 1, int(round(ratio * (len(values_sorted) - 1)))))
+    return values_sorted[idx]
 
-    有真实文字层的页，PyMuPDF 已经按段落分块，这里基本不动；
-    OCR 出来的页面每行都是独立文本对象，不合并的话 Markdown 会一行一段，
-    读起来支离破碎。
+
+def reflow_paragraphs(items: list[dict], page) -> list[dict]:
+    """把被切断的段落拼回去。
+
+    这里要处理两种"碎"法，两种都不能靠"这一行排满了没有"来判断：
+
+    1. OCR 出来的页：每行一个文本对象；
+    2. 有些 PDF（含本工具自己生成的演示件）PyMuPDF 会把一个自然段切成**多个多行块**
+       （例如第 1-2 行一块、第 3-4 行一块），块内 lines>1，但块与块之间仍是同一段。
+
+    原先用"整页最大行宽"判断行有没有排满；但两端对齐（justified）的正文里每一行
+    都顶到右边距，最大值与常见值没有区分度，判据失效、长段落被切碎。
+    真正可靠的信号是**标点**：段落最后一行以句末标点收尾，被切断的行不会；
+    行距与左边界只是辅助。所以合并条件改成"上一块结尾没有句末标点 + 左边界对齐 +
+    行距正常 + 下一块不是列表/标题"。
     """
     paras = [it for it in items if it["kind"] == "para"]
     if not paras:
         return items
-    col_right = max((it["x1"] for it in paras), default=0.0)
     page_width = abs(page.rect.width) or 1.0
+    # 行高用"块高 / 块内行数"估计，块可能是多行的
+    heights = sorted((it.get("y1", it["y0"]) - it["y0"]) / max(1, it.get("lines", 1))
+                     for it in paras if it.get("y1", it["y0"]) > it["y0"])
+    line_h = _pct(heights, 0.5) or 12.0
+
     merged: list[dict] = []
     for it in items:
         if it["kind"] != "para" or not merged:
             merged.append(it)
             continue
         prev = merged[-1]
-        if prev["kind"] != "para" or prev.get("lines", 1) > 1:
+        if prev["kind"] != "para":
             merged.append(it)
             continue
-        line_h = max(1.0, it["y0"] - prev["y0"])
+        # y1 是块底边；旧版本只存了 y0，这里做兼容（缺 y1 时按行高估算）
+        prev_bottom = prev.get("y1", prev["y0"] + line_h * max(1, prev.get("lines", 1)))
+        gap = it["y0"] - prev_bottom            # 上一块底 → 本块顶
         same_column = abs(it["x0"] - prev["x0"]) <= page_width * 0.02
-        prev_full = prev["x1"] >= col_right - line_h * 1.6
-        tight = (it["y0"] - prev["y0"]) <= line_h * 1.6
+        tight = gap <= line_h * 0.9            # 正常行距；明显加大的间距=新段
         ends_soft = prev["text"][-1:] not in SENTENCE_END
         starts_plain = not LIST_START.match(it["text"]) and \
             classify_heading(it["text"], it.get("size", 0), False, 0,
                              allow_size=False) is None
-        if same_column and prev_full and tight and ends_soft and starts_plain:
+        if same_column and tight and ends_soft and starts_plain:
             prev["text"] = _join_lines([prev["text"], it["text"]])
-            prev["lines"] = prev.get("lines", 1) + 1
-            prev["x1"] = it["x1"]
+            prev["lines"] = prev.get("lines", 1) + it.get("lines", 1)
+            prev["x1"] = max(prev["x1"], it["x1"])
+            prev["y1"] = it["y1"]
             continue
         merged.append(it)
     return merged
@@ -768,10 +790,16 @@ def cmd_to_ai(args):
     # 所以这类页面只认"第X章/第X节"这类文字特征。
     synthetic_book = mode in ("scanned", "text-garbled")
     analyzed: list[tuple[int, dict]] = []
+    # 输入本身可能已经带了我们写进去的 OCR 隐藏文字层（例如上一轮 ocr 产出的 _ocr.pdf）。
+    # 这种页的文字不是原书的可信文字层，manifest 的 source 必须标成 ocr，
+    # 否则下游会把 OCR 文本当成可逐字引用的正文——见 page_has_ocr_layer 的说明。
+    existing_ocr_layer: dict[int, bool] = {}
     for n in pages:
         page = doc[n - 1]
+        has_ocr_layer = page_has_ocr_layer(page)
+        existing_ocr_layer[n] = has_ocr_layer
         synthetic = (synthetic_book or ocr_page_source.get(n) == "ocr"
-                     or page_has_ocr_layer(page))
+                     or has_ocr_layer)
         info = analyze_page(page, tables=args.tables, min_rows=args.min_rows,
                             min_cols=args.min_cols, table_strategy=args.table_strategy,
                             drop_headers=not args.keep_headers,
@@ -808,8 +836,12 @@ def cmd_to_ai(args):
             body = ("（本页没有可提取的文字：扫描图版页，需视觉阅读——"
                     "用 pdftool.py render 出图后判读，或用 ocr 加文字层）")
             head_source = "none"
-        elif n in ocr_page_source:
-            head_source = ocr_page_source[n]
+        elif ocr_page_source.get(n) == "ocr":
+            # 本次内联 OCR 新加的文字层
+            head_source = "ocr"
+        elif existing_ocr_layer.get(n):
+            # 输入文件里本来就有的 OCR 文字层（同一次 ocr 的产物，或用户给的 _ocr.pdf）
+            head_source = "ocr"
         else:
             head_source = "text" if (n < len(texts) and texts[n].strip()) else "none"
         md_parts.append(f"{C.PAGE_MARK.format(n)}\n\n{body}\n")
@@ -1071,7 +1103,10 @@ def cmd_images(args):
     doc = C.open_doc(args.pdf, password=args.password)
     pages = C.parse_pages(args.pages, doc.page_count, offset=args.offset,
                           default_n=doc.page_count)
-    out_dir = Path(C.norm_path(args.out))
+    # 没给 --out 时落到与原件同目录的 <文件名>_images/，和 to-ai 的 <文件名>_ai/ 一致
+    out_target = args.out or (Path(C.norm_path(args.pdf)).parent /
+                              f"{C.slugify(Path(C.norm_path(args.pdf)).stem, 40)}_images")
+    out_dir = Path(C.norm_path(str(out_target)))
     if not args.list:
         out_dir.mkdir(parents=True, exist_ok=True)
     pymupdf = C.import_pymupdf()
@@ -1305,6 +1340,28 @@ def cmd_split(args):
     else:
         ranges = C.parse_ranges(args.ranges, page_count)
         how = "按给定页范围"
+        # 安全网：页范围是用户手写的，写漏一段就可能把整页书悄悄丢掉。
+        # 明确报出没被任何区间覆盖的页，而不是安静地少切几页。
+        covered: set[int] = set()
+        for a, b in ranges:
+            covered.update(range(a, b + 1))
+        missing = [p for p in range(1, page_count + 1) if p not in covered]
+        if missing:
+            shown = ", ".join(f"p.{p}" for p in missing[:20])
+            more = f" 等 {len(missing)} 页" if len(missing) > 20 else ""
+            print(f"⚠ 有 {len(missing)} 页不在任何页范围里，不会出现在任何分册中：{shown}{more}")
+            print("  （如果这不是你要的，补全 --ranges；要按固定页数切改用 --every N）")
+        # 重叠区间会让同一页出现在两个分册里，也提示一下
+        seen: set[int] = set()
+        overlaps: set[int] = set()
+        for a, b in ranges:
+            for p in range(a, b + 1):
+                if p in seen:
+                    overlaps.add(p)
+                seen.add(p)
+        if overlaps:
+            shown = ", ".join(f"p.{p}" for p in sorted(overlaps)[:20])
+            print(f"⚠ 有 {len(overlaps)} 页同时落在多个页范围里（会重复出现在多个分册中）：{shown}")
 
     if args.limit and len(ranges) > args.limit:
         print(f"⚠ 会切出 {len(ranges)} 个文件，只做前 {args.limit} 个"
@@ -1367,7 +1424,10 @@ def cmd_merge(args):
             toc.append([1, Path(f).stem, offset + 1])
         if entries and not degenerate:
             sub = [(lvl, t, p) for lvl, t, p in entries if lvl <= args.level]
-            base = 1 if args.toc_title else 0
+            # --toc-title 只给每个来源加一条顶层书签，**不该顺手把源书签整体压深一级**：
+            # 以前两者一起做（base=1），结果一本原本"章=1级"的书合并后变成"章=2级"，
+            # 层级整体下沉、和原书对不上。要嵌套层级请显式加 --nest-toc。
+            base = 1 if (args.toc_title and args.nest_toc) else 0
             for lvl, t, p in sub:
                 toc.append([min(lvl + base, 6), str(t).strip(), offset + p])
             bookmark_note = len(sub)
@@ -1588,6 +1648,16 @@ def cmd_forms(args):
         out_path.parent.mkdir(parents=True, exist_ok=True)
         doc.save(str(out_path), garbage=3, deflate=True)
         print(f"已写出 → {out_path}（填了 {filled} 个字段）")
+        if values:
+            # 回显必须来自**已写出的文件**：rows 是填写之前读的，
+            # 直接拿它打印会把旧值当成结果给用户看（磁盘上其实已经写对了）。
+            try:
+                with C.open_doc(str(out_path)) as check_doc:
+                    saved_rows = field_rows(check_doc)
+                if saved_rows:
+                    rows = saved_rows
+            except Exception as exc:
+                C.warn(f"回读已写出的文件核对字段值失败：{exc}")
     elif values:
         print(f"⚠ 填了 {filled} 个字段但没有 --out，改动没有保存。"
               "加 --out <输出.pdf> 才会落盘。")
@@ -1607,7 +1677,18 @@ def cmd_outline(args):
     doc = C.open_doc(args.pdf, password=args.password)
     toc = doc.get_toc(simple=True)
     if args.set:
-        data = json.loads(Path(C.norm_path(args.set)).read_text(encoding="utf-8"))
+        # 这是本工具里唯一会抛原始 traceback 的路径：文件不存在 / JSON 坏掉
+        # 都会直接冒到用户面前，与其他子命令"一行中文提示 + exit 2"不一致。
+        set_path = Path(C.norm_path(args.set))
+        if not set_path.exists():
+            C.die(f"--set 指定的 JSON 不存在：{set_path}\n"
+                  "  先用 outline --json 导出一份，改好再用 --set 写回。")
+        try:
+            data = json.loads(set_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            C.die(f"--set 的 JSON 解析不了：{set_path}\n"
+                  f"  第 {exc.lineno} 行第 {exc.colno} 列：{exc.msg}\n"
+                  "  期望格式：[[1,\"第一章\",1],[2,\"小节\",3]] 或 {\"toc\": [[…]]}")
         if isinstance(data, dict):
             data = data.get("toc", [])
         toc_new = [[int(a), str(b), int(c)] for a, b, c in data]
@@ -1685,7 +1766,7 @@ def build_parser():
     p.add_argument("pdf")
     p.add_argument("--method", choices=["auto", "pymupdf", "pdftotext"], default="auto")
     p.add_argument("--json", action="store_true")
-    p.add_argument("--out", help="把报告写成 JSON 文件")
+    p.add_argument("-o", "--out", help="把报告写成 JSON 文件")
 
     p = add("text", cmd_text, "抽正文（带 [[p.N]] 页锚）")
     p.add_argument("pdf")
@@ -1694,12 +1775,12 @@ def build_parser():
     p.add_argument("--mode", choices=["raw", "blocks", "markdown"], default="raw",
                    help="raw=原样抽取；blocks=按块排序；markdown=带标题/表格/插图")
     p.add_argument("--tables", action="store_true", help="markdown 模式下识别表格")
-    p.add_argument("--out", help="写到文件（默认打印）")
+    p.add_argument("-o", "--out", help="写到文件（默认打印）")
     p.add_argument("--default-pages", type=int, default=12)
 
     p = add("to-ai", cmd_to_ai, "打成 AI 友好包：Markdown + 页锚全文 + manifest")
     p.add_argument("pdf")
-    p.add_argument("--out", help="输出目录（默认 <文件名>_ai）")
+    p.add_argument("-o", "--out", help="输出目录（默认 <文件名>_ai）")
     p.add_argument("--title", help="书名/标题（默认取文件名）")
     p.add_argument("--pages", help="只打包这些页")
     p.add_argument("--offset", type=int, default=0)
@@ -1724,7 +1805,7 @@ def build_parser():
 
     p = add("ocr", cmd_ocr, "给扫描版加可搜索文字层（另可选导出页锚全文）")
     p.add_argument("pdf")
-    p.add_argument("--out", help="输出 PDF（默认 <文件名>_ocr.pdf）")
+    p.add_argument("-o", "--out", help="输出 PDF（默认 <文件名>_ocr.pdf）")
     p.add_argument("--pages", help="只做这些页（默认全书）")
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--dpi", type=int, default=300)
@@ -1743,7 +1824,7 @@ def build_parser():
     p.add_argument("pdf")
     p.add_argument("--pages", help="页范围（默认全书）")
     p.add_argument("--offset", type=int, default=0)
-    p.add_argument("--out", help="输出目录（默认只打印，不落盘）")
+    p.add_argument("-o", "--out", help="输出目录（默认只打印，不落盘）")
     p.add_argument("--format", choices=["csv", "md", "all"], default="csv")
     p.add_argument("--table-strategy", choices=["lines", "text"], help="find_tables 策略")
     p.add_argument("--min-rows", type=int, default=2)
@@ -1753,7 +1834,11 @@ def build_parser():
 
     p = add("images", cmd_images, "提取内嵌图片；--render-pages 则是整页出图")
     p.add_argument("pdf")
-    p.add_argument("--out", required=True, help="输出目录")
+    # 不填 --out 时落到 <文件名>_images/：文档里多处把它写成可选
+    # （如 interop-book-kb.md 的 "images --render-pages --dpi 200"），
+    # 但 CLI 一直要求必填，照文档敲会直接报缺参数。
+    p.add_argument("-o", "--out", default=None,
+                   help="输出目录（默认 <文件名>_images）")
     p.add_argument("--pages", help="页范围（默认全书）")
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--render-pages", action="store_true", help="渲染整页为 PNG")
@@ -1784,11 +1869,11 @@ def build_parser():
     p.add_argument("--offset", type=int, default=0)
     p.add_argument("--dpi", type=int, default=150)
     p.add_argument("--max-width", type=int, default=1500)
-    p.add_argument("--out", default="pdf_pages", help="输出目录（默认 pdf_pages）")
+    p.add_argument("-o", "--out", default="pdf_pages", help="输出目录（默认 pdf_pages）")
 
     p = add("split", cmd_split, "拆分 PDF（按页数/页范围/书签/大小）")
     p.add_argument("pdf")
-    p.add_argument("--out", required=True, help="输出目录")
+    p.add_argument("-o", "--out", required=True, help="输出目录")
     p.add_argument("--every", type=int, help="每 N 页一个文件")
     p.add_argument("--ranges", help="页范围清单，如 1-20,21-45")
     p.add_argument("--by-bookmarks", action="store_true", help="按顶层书签切")
@@ -1800,9 +1885,11 @@ def build_parser():
 
     p = add("merge", cmd_merge, "合并 PDF（可选带书签）")
     p.add_argument("files", nargs="+", help="按顺序合并的文件")
-    p.add_argument("--out", required=True)
+    p.add_argument("-o", "--out", required=True)
     p.add_argument("--toc", help="自定义书签 JSON：[[级别, 标题, 页码], ...]")
     p.add_argument("--toc-title", action="store_true", help="给每个来源文件加一条顶层书签")
+    p.add_argument("--nest-toc", action="store_true",
+                   help="把来源书签整体降一级挂到 --toc-title 下面（默认保持原层级）")
     p.add_argument("--level", type=int, default=3, help="沿用来源书签的层级上限")
     p.add_argument("--no-toc", action="store_true")
     p.add_argument("--title", help="写入 PDF 元数据标题")
@@ -1811,7 +1898,7 @@ def build_parser():
 
     p = add("pages", cmd_pages, "页面级手术：选取/删除/旋转/倒序")
     p.add_argument("pdf")
-    p.add_argument("--out", required=True)
+    p.add_argument("-o", "--out", required=True)
     p.add_argument("--select", help="只保留这些页，如 1-20,30")
     p.add_argument("--delete", help="删掉这些页")
     p.add_argument("--rotate", action="append", help="形如 3:90 或 5-8:180（可多次）")
@@ -1829,7 +1916,7 @@ def build_parser():
     p.add_argument("--reset", action="store_true", help="清空所有字段")
     p.add_argument("--flatten", action="store_true", help="扁平化（字段变普通内容）")
     p.add_argument("--flatten-annots", action="store_true", help="连注释一起扁平化")
-    p.add_argument("--out", help="输出 PDF（不填则只查看）")
+    p.add_argument("-o", "--out", help="输出 PDF（不填则只查看）")
     p.add_argument("--quiet", action="store_true")
 
     p = add("outline", cmd_outline, "读书签大纲 / 导出 / 写入自定义书签")
@@ -1840,7 +1927,7 @@ def build_parser():
     p.add_argument("--max-level", type=int, default=3)
     p.add_argument("--level", type=int, default=2, help="--chapters 用的层级")
     p.add_argument("--set", help="按 JSON 写入书签（[[级别,标题,页码],...]）")
-    p.add_argument("--out", help="--set 时的输出文件")
+    p.add_argument("-o", "--out", help="--set 时的输出文件")
     p.add_argument("--force", action="store_true", help="占位书签也照打")
 
     return ap

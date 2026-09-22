@@ -218,10 +218,17 @@ def parse_pages(spec: str | None, page_count: int, offset: int = 0,
 
 
 def parse_ranges(spec: str | None, page_count: int) -> list[tuple[int, int]]:
-    """解析成若干 (起, 止) 闭区间；区间按时间顺序合并，用于拆分。"""
+    """解析成若干 (起, 止) 闭区间，用于拆分。
+
+    这里**原样保留**用户写出的每一段：`--ranges 1-2,3-4` 就是两个区间、两个文件。
+    早先的版本会把"相邻"区间也合并（a <= 上一段末尾 + 1），于是
+    `--ranges 1-2,3-4,5-6` 在 8 页文件上只产出 1 个 1-6 页的文件、7-8 页被静默丢掉——
+    合并相邻区间等于悄悄改掉用户要的切法，所以现在不合并；
+    重叠区间也照原样返回，由 cmd_split 报出来。
+    """
     if not spec:
         return [(1, page_count)]
-    pairs: list[tuple[int, int]] = []
+    out: list[tuple[int, int]] = []
     for part in str(spec).split(","):
         part = part.strip()
         if not part:
@@ -236,15 +243,8 @@ def parse_ranges(spec: str | None, page_count: int) -> list[tuple[int, int]]:
             return []
         a, b = max(1, a), min(page_count, b)
         if a <= b:
-            pairs.append((a, b))
-    pairs.sort()
-    merged: list[tuple[int, int]] = []
-    for a, b in pairs:
-        if merged and a <= merged[-1][1] + 1:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
-        else:
-            merged.append((a, b))
-    return merged or [(1, page_count)]
+            out.append((a, b))
+    return out or [(1, page_count)]
 
 
 def greedy_chunks(ranges: list[tuple[int, int]], weights: dict[int, int],

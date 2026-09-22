@@ -16,6 +16,52 @@ PDF 有一件事最容易被搞错：**扫描版 PDF 里没有文字**（一页�
 加完文字层的 PDF 是本 skill 最有价值的产物：原件视觉上分毫未变，
 但能选中、能 Ctrl+F、能被文字提取器读到。
 
+## 本机 DSH 适配规则（实测约束）
+
+> 本节只记录**本机环境**带来的约束，不改变本 skill 的代码。
+> 本 skill 的已知缺陷已在本机副本中修复（见本节末尾"已修复"清单），
+> 因此下文不再有"绕开缺陷"的规则——按 SKILL.md 正文正常用即可。
+
+**调用方式**
+
+```bash
+<py> = C:\Users\zhouyi\.agents\skills\pdf-toolkit\.venv\Scripts\python.exe
+<skill> = C:\Users\zhouyi\.agents\skills\pdf-toolkit
+命令：<py> "<skill>\scripts\pdftool.py" <子命令> ...
+```
+
+**两条环境约束**
+
+1. **沙箱内并发 OCR 会被降级。** 多进程 OCR 会撞 `PermissionError [WinError 5]` 并自动回退单进程，
+   最终仍成功，只是慢。在 DSH 会话里把 `--jobs` 当无效参数看待。
+2. **不要用 `tempfile.mkdtemp`。** 本沙箱里 0o700 目录建成后既不能写也不能删（`chmod` 也救不回）。
+   本 skill 脚本没用到它，但你为它写的辅助脚本要用 `os.makedirs(..., exist_ok=True)`。
+   若某个 venv 里的 pip 因此报错，在该 venv 的 `site-packages` 放一个把 `os.mkdir` 强制 0o777 的
+   `sitecustomize.py` 即可（本机 pdf-toolkit / paper-research 的 venv 已放）。
+
+**本机不支持的事**
+
+- 本机 `git` 与 `curl.exe` 的 HTTPS 整体不可用（`schannel SEC_E_NO_CREDENTIALS`），
+  所以更新本 skill **不要用 `git clone`**，改用 `node -e "fetch(...)"` 拉 GitHub 的 tar/zip 解压覆盖。
+
+**已修复的缺陷（本机副本已改，上游待 PR）**
+
+| 原缺陷 | 修复后行为 |
+|---|---|
+| `to-ai` 把已有 OCR 文字层标成 `source:"text"` | 现在按隐藏字体 `ocr-cjk` 识别，正确标 `ocr`；原生文字层仍标 `text` |
+| `split --ranges` 合并相邻区间、静默丢页 | `--ranges 1-2,3-4,5-6` 现在产出 3 个文件；未覆盖页会明确警告；重叠也提示 |
+| Markdown 段落重排把软换行当段落结束 | 改用"句末标点为主 + 行距/左边界为辅"的判断，长段落不再被切碎（含多行块的情况） |
+
+**实测基线（可拿来对照自己的结果）**
+
+| 操作 | 实测结果 |
+|---|---|
+| `check` | pymupdf 1.28.2 + rapidocr 可用（自带 PP-OCRv6 中文模型，离线） |
+| 8 页扫描件 `ocr --dpi 300` | 19 秒，平均置信度 0.965，8/8 页写入文字层，产出可搜索 PDF |
+| OCR 后 `search --pattern 权衡` | 8/8 页命中；`[[p.N]]` 页锚数 == 真实页数 |
+| `info --method pymupdf` | 8 页扫描件 → `scanned`；加 OCR 后 → `text-partial`（8/8 页） |
+| `split --every 2`（8 页） | 4 个文件，页数合计 8 |
+| `to-ai` 对已有 OCR 层 / 原生层 | `source` 分别为 `ocr` / `text`（各 8 页 / 2 页，实测） |
 ## 产出物在哪
 
 工作目录随命令的 `--out` 走。默认位置：
